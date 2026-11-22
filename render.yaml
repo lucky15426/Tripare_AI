@@ -1,70 +1,34 @@
-# Render Blueprint: backend side of StaySync (the frontend goes to Vercel, see vercel.json).
-# Render dashboard -> New -> Blueprint -> pick this repo. Values marked "sync: false" are asked for at creation.
+# Render Blueprint: the WHOLE backend as ONE web service + Redis. (The frontend goes to Vercel, see vercel.json.)
 #
-# NOTE: `worker` and `temporal` (private service) require a paid Render instance type; Render has no free tier for them.
-# Temporal here is the single-binary dev server with in-memory history (it is lost on restart). That is acceptable
-# because the hotel data lives in Redis; for durable history use Temporal Cloud instead (see README, Deployment).
+# The single service runs the API, the mock suppliers, a real Temporal dev server and the Temporal worker in one
+# process (EMBEDDED_TEMPORAL=true). Temporal's workflow history is kept in memory and resets on restart; all hotel
+# data lives in Redis. For durable history use Temporal Cloud instead (see README, "Deploy").
 
 services:
   - type: web
     name: staysync-api
-    runtime: docker
-    dockerfilePath: ./apps/backend/Dockerfile
-    dockerContext: .
-    plan: starter
-    healthCheckPath: /health
+    runtime: node
+    plan: starter # free works too but sleeps when idle, and the first request after a sleep takes ~1 minute
+    buildCommand: npm ci --include=dev && npm run build -w apps/backend
+    startCommand: npm run start -w apps/backend
+    healthCheckPath: /healthz
     envVars:
+      - key: NODE_VERSION
+        value: "22"
       - key: NODE_ENV
         value: production
-      - key: PORT
-        value: "4000"
+      - key: EMBEDDED_TEMPORAL
+        value: "true"
+      - key: REDIS_URL
+        fromService: { type: keyvalue, name: staysync-redis, property: connectionString }
       - key: CORS_ORIGIN
-        sync: false # your Vercel URL, e.g. https://staysync.vercel.app (comma-separate several)
+        sync: false # your Vercel URL, e.g. https://staysync.vercel.app (optional: defaults to any origin)
       - key: ENABLE_DEV_ENDPOINTS
-        value: "false" # set "true" to enable the supplier-failure simulation buttons on a demo
-      - key: REDIS_URL
-        fromService: { type: keyvalue, name: staysync-redis, property: connectionString }
-      - key: TEMPORAL_ADDRESS
-        fromService: { type: pserv, name: staysync-temporal, property: hostport }
-      - key: TEMPORAL_UI_URL
-        value: https://cloud.temporal.io # no UI is hosted in this setup
-      - key: SUPPLIER_A_URL
-        sync: false # https://<your-api>.onrender.com/supplierA
-      - key: SUPPLIER_B_URL
-        sync: false # https://<your-api>.onrender.com/supplierB
+        value: "false" # "true" enables the supplier-failure simulation buttons
       - key: OPENWEATHER_API_KEY
-        sync: false
+        sync: false # optional
       - key: GEOAPIFY_API_KEY
-        sync: false
-
-  - type: worker
-    name: staysync-worker
-    runtime: docker
-    dockerfilePath: ./apps/backend/Dockerfile
-    dockerContext: .
-    dockerCommand: node dist/worker.js
-    plan: starter
-    envVars:
-      - key: NODE_ENV
-        value: production
-      - key: REDIS_URL
-        fromService: { type: keyvalue, name: staysync-redis, property: connectionString }
-      - key: TEMPORAL_ADDRESS
-        fromService: { type: pserv, name: staysync-temporal, property: hostport }
-      - key: SUPPLIER_A_URL
-        sync: false # same values as the API
-      - key: SUPPLIER_B_URL
-        sync: false
-      - key: GEOAPIFY_API_KEY
-        sync: false
-
-  - type: pserv
-    name: staysync-temporal
-    runtime: image
-    image:
-      url: docker.io/temporalio/temporal:latest
-    dockerCommand: temporal server start-dev --ip 0.0.0.0 --port 7233 --headless
-    plan: starter
+        sync: false # optional
 
   - type: keyvalue
     name: staysync-redis

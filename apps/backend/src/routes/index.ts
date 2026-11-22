@@ -10,6 +10,10 @@ export function createRoutes(c: Container): Router {
   const router = Router();
 
   router.get('/health', system.health!);
+  // Cheap liveness probe for platform health checks (always 200 while the process is up).
+  router.get('/healthz', (_req, res) => {
+    res.json({ status: 'ok' });
+  });
 
   // Mocked external suppliers: independent of the aggregation code, reached over HTTP by activities.
   router.use('/supplierA', createSupplierRouter('Supplier A', c.simulations.supplierA, supplierAHotels));

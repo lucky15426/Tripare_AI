@@ -15,6 +15,7 @@ x-backend-env: &backend-env
   TEMPORAL_UI_URL: ${TEMPORAL_UI_URL:-http://localhost:8080}
   SUPPLIER_A_URL: http://backend:4000/supplierA
   SUPPLIER_B_URL: http://backend:4000/supplierB
+  EMBEDDED_TEMPORAL: "false" # compose runs Temporal and the worker as their own services
   CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-300}
   DEGRADED_CACHE_TTL_SECONDS: ${DEGRADED_CACHE_TTL_SECONDS:-30}
   SUPPLIER_TIMEOUT_MS: ${SUPPLIER_TIMEOUT_MS:-4000}

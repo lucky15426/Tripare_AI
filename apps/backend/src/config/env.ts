@@ -18,11 +18,15 @@ const schema = z.object({
   // Temporal Cloud / secured clusters: set TEMPORAL_TLS=true and (for API-key auth) TEMPORAL_API_KEY.
   TEMPORAL_TLS: bool.default(false),
   TEMPORAL_API_KEY: z.string().optional(),
+  // Single-service deploys: run a real Temporal dev server + the worker inside this process.
+  EMBEDDED_TEMPORAL: bool.default(false),
+  RUN_WORKER: bool.default(false),
   TEMPORAL_UI_URL: z.string().default('http://localhost:8080'),
 
   // Supplier clients call suppliers over HTTP, like any external service.
-  SUPPLIER_A_URL: z.string().default('http://localhost:4000/supplierA'),
-  SUPPLIER_B_URL: z.string().default('http://localhost:4000/supplierB'),
+  // Default: the suppliers mounted in this very process (uses the injected PORT, so no config on PaaS).
+  SUPPLIER_A_URL: z.string().optional(),
+  SUPPLIER_B_URL: z.string().optional(),
   SUPPLIER_TIMEOUT_MS: z.coerce.number().int().positive().default(4000),
   SUPPLIER_RETRY_INITIAL_MS: z.coerce.number().int().positive().default(500),
   SUPPLIER_RETRY_BACKOFF: z.coerce.number().positive().default(2),
@@ -43,11 +47,20 @@ const schema = z.object({
   FRANKFURTER_URL: z.string().default('https://api.frankfurter.app'),
 });
 
-export type Env = Omit<z.infer<typeof schema>, 'ENABLE_DEV_ENDPOINTS'> & { ENABLE_DEV_ENDPOINTS: boolean };
+export type Env = Omit<z.infer<typeof schema>, 'ENABLE_DEV_ENDPOINTS' | 'SUPPLIER_A_URL' | 'SUPPLIER_B_URL'> & {
+  ENABLE_DEV_ENDPOINTS: boolean;
+  SUPPLIER_A_URL: string;
+  SUPPLIER_B_URL: string;
+};
 
 export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
   // Treat empty strings (e.g. unset docker-compose vars) as undefined.
   const cleaned = Object.fromEntries(Object.entries(source).filter(([, v]) => v !== undefined && v !== ''));
   const parsed = schema.parse(cleaned);
-  return { ...parsed, ENABLE_DEV_ENDPOINTS: parsed.ENABLE_DEV_ENDPOINTS ?? parsed.NODE_ENV !== 'production' };
+  return {
+    ...parsed,
+    ENABLE_DEV_ENDPOINTS: parsed.ENABLE_DEV_ENDPOINTS ?? parsed.NODE_ENV !== 'production',
+    SUPPLIER_A_URL: parsed.SUPPLIER_A_URL ?? `http://127.0.0.1:${parsed.PORT}/supplierA`,
+    SUPPLIER_B_URL: parsed.SUPPLIER_B_URL ?? `http://127.0.0.1:${parsed.PORT}/supplierB`,
+  };
 }

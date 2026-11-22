@@ -96,19 +96,28 @@ Run each in its own terminal. Defaults point at `localhost`, so no backend `.env
 
 ## Deploy: Vercel + Render
 
-The frontend is static and goes to **Vercel**. The backend (API, worker, Redis, Temporal) goes to **Render**, because Temporal and the worker are long-running processes that serverless platforms cannot host.
+The frontend is static and goes to **Vercel**. The whole backend goes to **one Render web service** plus a Redis instance. In this mode the service runs the API, the mock suppliers, a real Temporal dev server and the Temporal worker inside a single process (`EMBEDDED_TEMPORAL=true`), so there is no separate worker and no Temporal account to create.
 
 1. Push the repo to GitHub.
-2. **Render:** *New → Blueprint*, select the repo (uses [`render.yaml`](render.yaml)). Provide `CORS_ORIGIN` (your Vercel URL) and `SUPPLIER_A_URL` / `SUPPLIER_B_URL` (`https://<your-api>.onrender.com/supplierA` and `/supplierB`, same values on the API and the worker). Redeploy once after you know the API URL.
-3. **Vercel:** import the repo (uses [`vercel.json`](vercel.json)) and set `VITE_API_BASE_URL` to the Render API URL, without a trailing slash.
-4. Check `https://<api>/health`, then open the Vercel site.
+2. **Render, Redis:** *New → Key Value* (free plan, same region as the web service). Copy its **Internal** URL.
+3. **Render, web service:** *New → Web Service*, pick the repo, runtime **Node**, root directory **empty**.
+   - Build command: `npm ci --include=dev && npm run build -w apps/backend`
+   - Start command: `npm run start -w apps/backend`
+   - Health check path: `/healthz`
+   - Environment: `NODE_VERSION=22`, `NODE_ENV=production`, `EMBEDDED_TEMPORAL=true`, `REDIS_URL=<the Internal URL>`
+   - Or use *New → Blueprint*, which reads [`render.yaml`](render.yaml) and sets all of this up.
+4. **Vercel:** import the repo (uses [`vercel.json`](vercel.json)) and set `VITE_API_BASE_URL` to the Render URL, without a trailing slash.
+5. Optional: set `CORS_ORIGIN` on Render to your Vercel URL (it defaults to allowing any origin).
+6. Check `https://<api>/health` (all services healthy), then open the Vercel site.
 
 Notes:
 
-- The Render worker and private Temporal service need paid instances; Redis (Key Value) can use the free plan.
-- The bundled Temporal is the dev server with **in-memory history** (lost on restart; hotel data lives in Redis and is unaffected). For durable history use Temporal Cloud: set `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_TLS=true`, `TEMPORAL_API_KEY`, and remove the `staysync-temporal` service from `render.yaml`.
+- The first start downloads the Temporal server binary, so it takes a minute or two. `/health` reports Temporal as unhealthy until it is up, while `/healthz` always answers, which is why Render uses it.
+- Memory: Temporal plus the API use roughly 350–400 MB, so a 512 MB instance works but has little headroom. Use a bigger instance if you see out-of-memory restarts.
+- Free instances sleep when idle; the first request afterwards waits for a cold start, including re-downloading the Temporal binary.
+- Embedded Temporal keeps workflow **history in memory** (reset on restart). Hotel data is in Redis and unaffected. For durable history use Temporal Cloud: leave `EMBEDDED_TEMPORAL` off and set `RUN_WORKER=true`, `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_TLS=true` and `TEMPORAL_API_KEY` (untested against Temporal Cloud).
 - Set `ENABLE_DEV_ENDPOINTS=true` if you want the supplier-failure simulation buttons on a hosted demo.
-- A single VPS also works: run `docker compose up -d --build` behind a reverse proxy, and do not expose ports 6379, 7233 or 8080.
+- A single VPS also works: run `docker compose up -d --build` behind a reverse proxy, without exposing ports 6379, 7233 or 8080.
 
 ## Configuration
 
@@ -120,7 +129,8 @@ Complete list in [`.env.example`](.env.example). The ones you will touch most:
 | `CACHE_TTL_SECONDS` | `300` | How long aggregated results stay cached (degraded results use `DEGRADED_CACHE_TTL_SECONDS`, 30) |
 | `TEMPORAL_ADDRESS` · `TEMPORAL_NAMESPACE` · `TEMPORAL_TASK_QUEUE` | `localhost:7233` · `default` · `hotel-offers` | Temporal connection |
 | `TEMPORAL_TLS` · `TEMPORAL_API_KEY` | `false` · empty | For Temporal Cloud or a secured cluster |
-| `SUPPLIER_A_URL` · `SUPPLIER_B_URL` | `http://localhost:4000/supplierX` | Where the worker calls suppliers |
+| `EMBEDDED_TEMPORAL` · `RUN_WORKER` | `false` · `false` | Run Temporal + the worker (or just the worker) inside the API process |
+| `SUPPLIER_A_URL` · `SUPPLIER_B_URL` | this process (`/supplierA`, `/supplierB`) | Set only to point at external suppliers |
 | `SUPPLIER_TIMEOUT_MS` · `SUPPLIER_RETRY_*` | `4000` · `500ms, ×2, 3 attempts` | Timeout and retry policy |
 | `ENABLE_DEV_ENDPOINTS` | `true` outside production | Supplier failure simulation endpoints |
 | `CORS_ORIGIN` | `*` | Allowed browser origins (comma-separated) |

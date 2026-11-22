@@ -1,7 +1,15 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { NativeConnection, Worker } from '@temporalio/worker';
 import { createActivities, type ActivityDeps } from '../activities';
 import type { Env } from '../config/env';
 import { logger } from '../utils/logger';
+
+/** Compiled .js in production, the .ts source under tsx/vitest. */
+function workflowsEntry(): string {
+  const base = path.join(__dirname, '../workflows/index');
+  return fs.existsSync(`${base}.js`) ? `${base}.js` : `${base}.ts`;
+}
 
 /** Creates a worker that registers hotelOfferWorkflow and every activity. */
 export async function createWorker(deps: ActivityDeps & { connection: NativeConnection }): Promise<Worker> {
@@ -11,7 +19,7 @@ export async function createWorker(deps: ActivityDeps & { connection: NativeConn
     namespace: env.TEMPORAL_NAMESPACE,
     taskQueue: env.TEMPORAL_TASK_QUEUE,
     // Resolves to the .ts file under tsx and to the compiled .js in production.
-    workflowsPath: require.resolve('../workflows'),
+    workflowsPath: workflowsEntry(),
     activities: createActivities({ env, cache }),
   });
 }
