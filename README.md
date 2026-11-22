@@ -1,292 +1,293 @@
-# StaySync – Hotel Offer Orchestrator
+<div align="center">
 
-StaySync compares hotel offers from two independent (mocked) suppliers, **orchestrated by a Temporal workflow**, cached in **Redis**, served by an **Express/TypeScript** API and explored through a **React** dashboard.
+# StaySync
 
-For every hotel it keeps the **cheapest valid offer**, remembers every competing offer, tells you how much you save, and keeps serving when a supplier fails.
+**Find the stay. Not just the price.**
 
-- [Features](#features) · [Architecture](#architecture) · [Quick start (Docker)](#quick-start-docker) · [Local development](#local-development) · [API](#api-documentation) · [Temporal](#temporal-workflow) · [Redis](#redis-implementation) · [Testing](#testing) · [Deployment](#deployment) · [Limitations](#limitations)
+A hotel offer orchestrator: it queries two suppliers in parallel with a Temporal workflow, keeps the cheapest offer for every hotel, caches the result in Redis, and shows it all in a React dashboard.
 
-## Features
+![Node](https://img.shields.io/badge/Node-22-74816A?style=flat-square) ![TypeScript](https://img.shields.io/badge/TypeScript-strict-172C35?style=flat-square) ![Temporal](https://img.shields.io/badge/Temporal-workflows-C87952?style=flat-square) ![Redis](https://img.shields.io/badge/Redis-sorted%20sets-172C35?style=flat-square) ![React](https://img.shields.io/badge/React-Vite%20%2B%20Tailwind-74816A?style=flat-square) ![Tests](https://img.shields.io/badge/tests-60%20passing-C87952?style=flat-square)
 
-| Area | What you get |
+![StaySync landing page](docs/screenshots/landing.jpg)
+
+</div>
+
+---
+
+## Contents
+
+[Screenshots](#screenshots) · [What it does](#what-it-does) · [How it works](#how-it-works) · [Quick start](#quick-start) · [Deploy](#deploy-vercel--render) · [Configuration](#configuration) · [API](#api) · [Deep dives](#deep-dives) · [Testing](#testing) · [Project layout](#project-layout) · [Limitations](#limitations)
+
+## Screenshots
+
+| | |
 | --- | --- |
-| Orchestration | `hotelOfferWorkflow`: Supplier A + B fetched **concurrently**, per-activity timeouts, exponential-backoff retries, independent failure handling, then normalize → aggregate → save to Redis (each a separate activity) |
-| Deduplication | Name normalisation (case, whitespace, punctuation, `&`, diacritics, leading "The"), cheapest valid price wins, deterministic tie-break, all competing offers kept |
-| Redis | Per-city sorted set (`ZRANGEBYSCORE` price filtering **inside Redis**), details hash, TTL, atomic refresh with no stale members, `X-Cache: HIT/MISS` |
-| Resilience | One supplier down → degraded-but-served result (`meta.degraded`); both down → `502 ALL_SUPPLIERS_FAILED` with per-supplier status |
-| API | Search, price/rating/supplier/name filters, sorting, refresh, per-hotel offer comparison, health, metrics, workflow history, analytics |
-| UI | Overview dashboard, hotel search (cards + Leaflet map), offer comparison modal, supplier monitoring with dev-only failure simulation, workflow timeline, analytics |
-| Integrations (all optional, with fallbacks) | OpenWeather, Geoapify, Frankfurter currency (display-only), Leaflet/OpenStreetMap |
+| ![Hotel search](docs/screenshots/search.jpg)<br>**Hotel search**: filters, sorting, price slider | ![Compare offers](docs/screenshots/compare-offers.jpg)<br>**Compare offers**: every supplier, cheapest marked |
+| ![Map view](docs/screenshots/map.jpg)<br>**Map view** (Leaflet + OpenStreetMap) | ![Dashboard](docs/screenshots/dashboard.jpg)<br>**Dashboard**: savings, supplier health, workflow activity |
+| ![Workflows](docs/screenshots/workflows.jpg)<br>**Workflow timeline**: parallel supplier calls, aggregation, Redis write | ![Suppliers](docs/screenshots/suppliers.jpg)<br>**Supplier monitoring** with dev-only failure simulation |
 
-## Architecture
+<details>
+<summary>More: destinations and analytics</summary>
+
+![Destinations](docs/screenshots/landing-destinations.jpg)
+![Analytics](docs/screenshots/analytics.jpg)
+
+</details>
+
+## What it does
+
+- **Cheapest offer per hotel.** Both suppliers list overlapping hotels with different prices and commissions. StaySync groups them by a normalised name, keeps the lowest valid price, and remembers every competing offer, so it can say *"Save ₹600 compared to the next offer."*
+- **Temporal orchestration.** One workflow fetches Supplier A and B concurrently, with timeouts and retries, then normalises, deduplicates and stores the result. Each step is a separate activity.
+- **Redis does the filtering.** Hotels sit in a sorted set scored by price, so `minPrice` / `maxPrice` are answered by `ZRANGEBYSCORE` inside Redis, not by filtering an array in Node.
+- **Survives supplier failures.** One supplier down means partial results flagged `degraded`; both down means a clear `502`.
+- **A real product UI.** Landing page, search with list/map views, offer comparison, supplier and workflow monitoring, analytics. Everything is wired to the live API.
+- **Optional extras with graceful fallbacks.** Weather (OpenWeather), city coordinates (Geoapify), currency display (Frankfurter). Missing keys never break search.
+
+## How it works
 
 ```mermaid
 flowchart LR
-  UI[React SPA<br/>TanStack Query] -->|REST| API[Express API<br/>Zod · Pino]
-  API -->|1. HIT?| R[(Redis<br/>ZSET + HASH)]
-  API -->|2. MISS: start workflow| T{{Temporal<br/>server}}
-  T <--> W[Temporal worker<br/>workflow + activities]
-  W -->|fetch A / fetch B<br/>in parallel| SA[Supplier A<br/>/supplierA/hotels]
-  W --> SB[Supplier B<br/>/supplierB/hotels]
-  W -->|saveToRedis| R
-  API -->|3. ZRANGEBYSCORE| R
-  API -->|result + meta| UI
+  UI["React app"] -->|REST| API["Express API"]
+  API -->|"1. cached?"| R[("Redis<br/>sorted set + hash")]
+  API -->|"2. miss: start workflow"| T{{"Temporal"}}
+  T <--> W["Worker<br/>workflow + activities"]
+  W -->|in parallel| SA["Supplier A"]
+  W -->|in parallel| SB["Supplier B"]
+  W -->|"save"| R
+  API -->|"3. ZRANGEBYSCORE"| R
 ```
 
-Request flow for `GET /api/hotels?city=delhi&minPrice=3000&maxPrice=8000`:
+1. A search request is validated, then `hotels:<city>` is checked in Redis.
+2. **Hit:** serve from cache (`X-Cache: HIT`). **Miss or `refresh=true`:** the API starts `hotelOfferWorkflow` with a unique ID and waits for it. Simultaneous misses for the same city share one workflow.
+3. The worker runs: `fetchSupplierA` ‖ `fetchSupplierB` ‖ `enrichCity` → `normalizeOffers` → `aggregateOffers` → `saveToRedis`.
+4. The API reads the price range from Redis, applies the remaining filters and sorting, and responds.
 
-1. API validates the query (Zod) and checks `hotels:delhi` in Redis.
-2. **Cache miss (or `refresh=true`)** → the API starts `hotelOfferWorkflow` with a unique workflow ID (`hotel-offers-<city>-<uuid>`) and **waits for the result**. Concurrent misses for the same city share one workflow (single-flight).
-3. The worker runs the workflow: both supplier activities in parallel → `normalizeOffers` → `aggregateOffers` → `saveToRedis`. An optional `enrichCity` activity (geocoding) runs alongside the suppliers.
-4. The API reads the price range from Redis (`ZRANGEBYSCORE`), applies the remaining filters/sorting, and responds with `data` + `meta`.
+## Quick start
 
-### Folder structure
-
-```
-staysync/
-├── apps/
-│   ├── backend/
-│   │   ├── src/
-│   │   │   ├── app.ts / server.ts / worker.ts / container.ts   # Express app, API entry, worker entry, composition root
-│   │   │   ├── config/        # env (Zod), supported cities
-│   │   │   ├── routes/ controllers/ middleware/ schemas/       # HTTP layer
-│   │   │   ├── services/      # offers (pure dedupe logic), hotelSearch, telemetry, health, analytics, external APIs
-│   │   │   ├── workflows/     # deterministic Temporal workflow (no I/O)
-│   │   │   ├── activities/    # all I/O: supplier HTTP, Redis, geocoding
-│   │   │   ├── temporal/      # client (starts workflows) + worker factory
-│   │   │   ├── suppliers/     # independent mock supplier APIs + latency/error/outage simulation
-│   │   │   ├── cache/         # Redis client + HotelCache (sorted-set layout)
-│   │   │   └── types/ utils/
-│   │   ├── tests/             # Vitest (unit, API, real-Temporal workflow + end-to-end)
-│   │   ├── scripts/           # dev-temporal.ts, verify-stack.ts
-│   │   └── Dockerfile
-│   └── frontend/
-│       ├── src/{pages,components,charts,hooks,services,layouts,utils,types}
-│       ├── nginx.conf
-│       └── Dockerfile
-├── docker-compose.yml
-├── .env.example
-├── postman/                   # collection + environment
-└── README.md
-```
-
-### Frontend routes
-
-`/` landing page · `/search` hotel search (accepts `?city=&minPrice=&maxPrice=&q=`) · `/dashboard` · `/suppliers` · `/workflows` · `/analytics`. The landing page's "Sign in" link opens the dashboard (the demo has no accounts). Photography is from Unsplash (credited in the footer).
-
-## Prerequisites
-
-- **Docker + Docker Compose** (recommended path), or
-- Node.js ≥ 20 (22 used in the Dockerfiles), npm ≥ 10, and a Redis server for local development.
-
-## Quick start (Docker)
+### Option A: Docker (everything in one command)
 
 ```bash
-cp .env.example .env        # optional: add OPENWEATHER_API_KEY / GEOAPIFY_API_KEY
+cp .env.example .env
 docker compose up --build
 ```
 
 | Service | URL |
 | --- | --- |
-| Frontend | http://localhost:3000 |
-| API | http://localhost:4000 (`/health`, `/api/...`) |
+| App | http://localhost:3000 |
+| API | http://localhost:4000 (`/health`) |
 | Temporal UI | http://localhost:8080 |
-| Temporal gRPC | `localhost:7233` |
-| Redis | `localhost:6379` |
 
-Services: `frontend` (nginx), `backend` (API + mock suppliers), `worker` (Temporal worker), `redis`, `temporal` (dev server with SQLite in a named volume), `temporal-ui`. Backend and worker wait for healthy Redis/Temporal; containers talk to each other by service name (`redis`, `temporal`, `backend`).
+> The compose file was written carefully but **has not been run on the authoring machine** (no Docker there). If something fails on your first run, the logs will say which service.
 
-> `VITE_API_BASE_URL` is baked into the frontend bundle **at build time** and must be a URL the *browser* can reach (default `http://localhost:4000`). Changing it requires `docker compose build frontend`.
+### Option B: local development
 
-## Local development
+You need Node 20+ and a Redis server (`docker run --rm -p 6379:6379 redis:7-alpine` is the quickest).
 
 ```bash
 npm install
 
-# 1. Redis (any Redis ≥ 5)
-docker run --rm -p 6379:6379 redis:7-alpine
-
-# 2. A local Temporal dev server on :7233 (no Docker needed; or use the Temporal CLI: `temporal server start-dev`)
-npm run dev:temporal
-
-# 3. API (+ mock suppliers) on :4000, worker, and frontend on :5173 — one terminal each
-npm run dev:backend
-npm run dev:worker
-cp apps/frontend/.env.example apps/frontend/.env   # VITE_API_BASE_URL=http://localhost:4000
-npm run dev:frontend
+npm run dev:temporal   # local Temporal dev server on :7233 (no Docker needed)
+npm run dev:backend    # API + mock suppliers on :4000
+npm run dev:worker     # Temporal worker
+npm run dev:frontend   # React app on :5173
 ```
 
-Defaults point at `localhost` for Redis/Temporal/suppliers, so no backend `.env` is needed. Production-style run: `npm run build -w apps/backend && npm run start -w apps/backend` (and `start:worker`).
+Run each in its own terminal. Defaults point at `localhost`, so no backend `.env` is required. For the frontend, optionally copy `apps/frontend/.env.example` to `apps/frontend/.env`.
 
-### Environment variables
+## Deploy: Vercel + Render
 
-See [`.env.example`](.env.example) (complete list). Highlights:
+The frontend is static and goes to **Vercel**. The backend (API, worker, Redis, Temporal) goes to **Render**, because Temporal and the worker are long-running processes that serverless platforms cannot host.
+
+1. Push the repo to GitHub.
+2. **Render:** *New → Blueprint*, select the repo (uses [`render.yaml`](render.yaml)). Provide `CORS_ORIGIN` (your Vercel URL) and `SUPPLIER_A_URL` / `SUPPLIER_B_URL` (`https://<your-api>.onrender.com/supplierA` and `/supplierB`, same values on the API and the worker). Redeploy once after you know the API URL.
+3. **Vercel:** import the repo (uses [`vercel.json`](vercel.json)) and set `VITE_API_BASE_URL` to the Render API URL, without a trailing slash.
+4. Check `https://<api>/health`, then open the Vercel site.
+
+Notes:
+
+- The Render worker and private Temporal service need paid instances; Redis (Key Value) can use the free plan.
+- The bundled Temporal is the dev server with **in-memory history** (lost on restart; hotel data lives in Redis and is unaffected). For durable history use Temporal Cloud: set `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_TLS=true`, `TEMPORAL_API_KEY`, and remove the `staysync-temporal` service from `render.yaml`.
+- Set `ENABLE_DEV_ENDPOINTS=true` if you want the supplier-failure simulation buttons on a hosted demo.
+- A single VPS also works: run `docker compose up -d --build` behind a reverse proxy, and do not expose ports 6379, 7233 or 8080.
+
+## Configuration
+
+Complete list in [`.env.example`](.env.example). The ones you will touch most:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection |
-| `CACHE_TTL_SECONDS` | `300` | TTL of aggregated data (5 min). Degraded results use `DEGRADED_CACHE_TTL_SECONDS` (30) so recovery is quick |
-| `TEMPORAL_ADDRESS` / `TEMPORAL_NAMESPACE` / `TEMPORAL_TASK_QUEUE` | `localhost:7233` / `default` / `hotel-offers` | Temporal connection |
-| `SUPPLIER_A_URL` / `SUPPLIER_B_URL` | `http://localhost:4000/supplierX` | Where activities call suppliers (swap for real suppliers) |
-| `SUPPLIER_TIMEOUT_MS`, `SUPPLIER_RETRY_INITIAL_MS`, `SUPPLIER_RETRY_BACKOFF`, `SUPPLIER_RETRY_MAX_ATTEMPTS` | `4000`, `500`, `2`, `3` | Activity timeout & retry policy |
-| `SUPPLIER_{A,B}_ENABLED / LATENCY_MS / ERROR_RATE` | `true / 250,550 / 0` | Initial mock-supplier behaviour |
-| `ENABLE_DEV_ENDPOINTS` | `true` unless `NODE_ENV=production` | Supplier-failure simulation endpoints |
-| `OPENWEATHER_API_KEY`, `GEOAPIFY_API_KEY` | empty | Optional integrations (graceful fallback when empty) |
-| `VITE_API_BASE_URL` | `http://localhost:4000` | Frontend → API URL |
+| `CACHE_TTL_SECONDS` | `300` | How long aggregated results stay cached (degraded results use `DEGRADED_CACHE_TTL_SECONDS`, 30) |
+| `TEMPORAL_ADDRESS` · `TEMPORAL_NAMESPACE` · `TEMPORAL_TASK_QUEUE` | `localhost:7233` · `default` · `hotel-offers` | Temporal connection |
+| `TEMPORAL_TLS` · `TEMPORAL_API_KEY` | `false` · empty | For Temporal Cloud or a secured cluster |
+| `SUPPLIER_A_URL` · `SUPPLIER_B_URL` | `http://localhost:4000/supplierX` | Where the worker calls suppliers |
+| `SUPPLIER_TIMEOUT_MS` · `SUPPLIER_RETRY_*` | `4000` · `500ms, ×2, 3 attempts` | Timeout and retry policy |
+| `ENABLE_DEV_ENDPOINTS` | `true` outside production | Supplier failure simulation endpoints |
+| `CORS_ORIGIN` | `*` | Allowed browser origins (comma-separated) |
+| `OPENWEATHER_API_KEY` · `GEOAPIFY_API_KEY` | empty | Optional integrations |
+| `VITE_API_BASE_URL` | `http://localhost:4000` | Frontend → API (baked in at build time) |
 
-## API documentation
+## API
 
-All hotel prices are **INR per night, supplier rates**. Errors share one shape: `{ "error": { "code", "message", "details?" }, "meta?" }`.
+Prices are **INR per night**. Errors share one shape: `{ "error": { "code", "message" }, "meta"? }`.
 
 ### `GET /api/hotels`
 
-| Param | Description |
+| Parameter | Notes |
 | --- | --- |
-| `city` (required) | Case-insensitive; normalised (`Delhi` → `delhi`). Supported: delhi, mumbai, bangalore, jaipur, goa, hyderabad. Other cities return an empty result |
-| `minPrice`, `maxPrice` | Inclusive range, each optional. `400` if not a non-negative number or `minPrice > maxPrice` |
-| `sortBy` | `price` (default) · `rating` · `commission` |
-| `sortOrder` | `asc` (default) · `desc` |
-| `supplier` | `Supplier A` / `Supplier B` – filters by the **winning** supplier |
-| `minRating`, `q` | Minimum rating (0–5), hotel-name search |
+| `city` *(required)* | Case-insensitive. Supported: delhi, mumbai, bangalore, jaipur, goa, hyderabad (others return an empty list) |
+| `minPrice`, `maxPrice` | Inclusive; either or both. `400` if invalid or `minPrice > maxPrice` |
+| `sortBy` | `price` (default), `rating`, `commission` |
+| `sortOrder` | `asc` (default), `desc` |
+| `supplier` | `Supplier A` or `Supplier B` (the winning supplier) |
+| `minRating`, `q` | Minimum rating; hotel-name search |
 | `refresh=true` | Bypass the cache and re-run the workflow |
 
-Headers: `X-Cache: HIT|MISS`, `X-Workflow-Id`, `X-Request-Id`.
+Response headers: `X-Cache: HIT|MISS`, `X-Workflow-Id`.
 
 ```jsonc
 // GET /api/hotels?city=delhi&minPrice=5000&maxPrice=6500
 {
-  "data": [
-    {
-      "hotelId": "b1", "slug": "grand palace", "name": "The Grand Palace", "city": "delhi",
-      "price": 5900, "supplier": "Supplier B", "commissionPct": 18, "rating": 4.5,
-      "latitude": 28.6139, "longitude": 77.209,
-      "originalPrice": 6500, "savings": 600, "priceDifference": 600, "competingOffers": 2,
-      "description": "…", "lastUpdated": "2026-11-22T06:12:50.071Z"
-    }
-  ],
+  "data": [{
+    "hotelId": "b1", "name": "The Grand Palace", "city": "delhi",
+    "price": 5900, "supplier": "Supplier B", "commissionPct": 18, "rating": 4.5,
+    "latitude": 28.6139, "longitude": 77.209,
+    "originalPrice": 6500, "savings": 600, "competingOffers": 2
+  }],
   "meta": {
-    "city": "delhi", "totalHotels": 7, "filteredHotels": 3, "minPrice": 5000, "maxPrice": 6500,
-    "cache": "HIT", "refreshed": false, "workflowId": "hotel-offers-delhi-0e76a8de-…",
-    "degraded": false, "supplierStatus": { "supplierA": "success", "supplierB": "success" },
-    "lastUpdated": "…", "cacheTtlSeconds": 287, "cityInfo": { "latitude": 28.6139, "longitude": 77.209, "source": "builtin" },
-    "timestamp": "…"
+    "city": "delhi", "totalHotels": 7, "filteredHotels": 3,
+    "minPrice": 5000, "maxPrice": 6500, "cache": "HIT", "workflowId": "hotel-offers-delhi-…",
+    "degraded": false, "supplierStatus": { "supplierA": "success", "supplierB": "success" }
   }
 }
 ```
 
-Degraded: `meta.degraded: true`, `meta.supplierStatus: { "supplierA": "failed", "supplierB": "success" }` and `data` contains only the surviving supplier's hotels. Both suppliers down → `502`:
-`{ "error": { "code": "ALL_SUPPLIERS_FAILED", … }, "meta": { "degraded": true, "supplierStatus": { "supplierA": "failed", "supplierB": "failed" }, "workflowId": "…" } }`.
+Degraded result: `meta.degraded: true` and `supplierStatus` shows which one failed; only the surviving supplier's hotels are returned. Both down: `502 ALL_SUPPLIERS_FAILED` with the same `supplierStatus` in `meta`.
 
 ### `GET /api/hotels/:hotelName/offers?city=delhi`
 
-Every supplier offer for one hotel (name matched after normalisation, so `the grand palace` works).
+All supplier offers for one hotel (`the grand palace` and `The Grand Palace` match the same hotel):
 
 ```json
 {
-  "hotel": "The Grand Palace", "city": "delhi",
+  "hotel": "The Grand Palace",
   "offers": [
-    { "supplier": "Supplier B", "hotelId": "b1", "price": 5900, "commissionPct": 18, "rating": 4.5, "priceDifference": 0, "isBest": true },
-    { "supplier": "Supplier A", "hotelId": "a1", "price": 6500, "commissionPct": 12, "rating": 4.5, "priceDifference": 600, "isBest": false }
+    { "supplier": "Supplier B", "price": 5900, "commissionPct": 18, "isBest": true },
+    { "supplier": "Supplier A", "price": 6500, "commissionPct": 12, "isBest": false, "priceDifference": 600 }
   ],
-  "bestOffer": { "supplier": "Supplier B", "price": 5900, "commissionPct": 18 },
+  "bestOffer": { "supplier": "Supplier B", "price": 5900 },
   "savings": 600
 }
 ```
 
-### Other endpoints
+### Everything else
 
-| Endpoint | Description |
+| Endpoint | What it returns |
 | --- | --- |
-| `GET /supplierA/hotels?city=` · `GET /supplierB/hotels?city=` | Mock suppliers (`/health` too). Simulated latency, `503` when disabled, `500` at the configured error rate |
-| `GET /health` | `{ status: healthy\|degraded\|unhealthy, timestamp, services: { api, redis, temporal, supplierA, supplierB } }`. Supplier down → `degraded` (200); Redis/Temporal down → `unhealthy` (503). Live probes, nothing cached |
-| `GET /api/metrics` | Requests, cache hits/misses/ratio, workflow executions/failures, supplier failures, avg supplier response time, avg workflow duration, hotels aggregated, last refresh, per-supplier stats. Contains no secrets |
-| `GET /api/workflows` | Recent workflow executions with per-step timings/attempts (recorded from real workflow results) |
-| `GET /api/suppliers` · `GET /api/recent-searches` · `GET /api/analytics` · `GET /api/cities` | Dashboard data |
-| `GET /api/weather?city=` | OpenWeather: `{ available, temperatureC, condition, icon, humidity }` or `{ available: false, reason }` |
-| `GET /api/geocode?city=` | Geoapify coordinates, falling back to a built-in table for the supported cities |
-| `GET /api/currency` | INR → USD/EUR/GBP rates from Frankfurter (cached 1h). Used for **display only** |
-| `POST /api/dev/suppliers/:supplierA\|supplierB` `{ enabled?, latencyMs?, errorRate? }` · `POST /api/dev/suppliers/reset` | Failure simulation. Disabled when `ENABLE_DEV_ENDPOINTS=false` (default in production) |
+| `GET /health` | `healthy` / `degraded` / `unhealthy` plus API, Redis, Temporal and both suppliers (live probes). Supplier down = degraded (200). Redis or Temporal down = `503` |
+| `GET /api/metrics` | Requests, cache hits/misses/ratio, workflow executions and failures, supplier failures, average response and workflow times, hotels aggregated, last refresh |
+| `GET /api/workflows` | Recent workflow executions with per-step timings and attempts |
+| `GET /api/suppliers`, `/api/analytics`, `/api/recent-searches`, `/api/cities` | Data for the dashboard pages |
+| `GET /api/weather?city=` · `/api/geocode?city=` · `/api/currency` | Optional integrations (always answer, with `available: false` when unconfigured) |
+| `GET /supplierA/hotels?city=` · `/supplierB/hotels?city=` | The mock supplier APIs |
+| `POST /api/dev/suppliers/:supplierA\|supplierB` · `/api/dev/suppliers/reset` | Failure simulation (`{ "enabled": false }`, `latencyMs`, `errorRate`). Disabled when `ENABLE_DEV_ENDPOINTS=false` |
 
-## Temporal workflow
+A ready-made [Postman collection](postman/StaySync.postman_collection.json) with assertions is included. Import it with `postman/StaySync.postman_environment.json`, or run `npx newman run postman/StaySync.postman_collection.json -e postman/StaySync.postman_environment.json`.
 
-`hotelOfferWorkflow(input)` (`apps/backend/src/workflows/hotelOffer.workflow.ts`):
+## Deep dives
 
-1. Start **Supplier A**, **Supplier B** and (optional) **city enrichment** concurrently with `Promise.all`. Each supplier call is wrapped so a failure becomes a result instead of rejecting the group → suppliers fail independently.
-2. Supplier activities: `startToCloseTimeout = SUPPLIER_TIMEOUT_MS + 500ms`, retry policy `initialInterval=500ms, backoffCoefficient=2, maximumAttempts=3` (all configurable, never infinite). HTTP 4xx and malformed payloads are non-retryable.
-3. Both failed → the workflow throws `ApplicationFailure.nonRetryable('ALL_SUPPLIERS_FAILED', …details)`; the API maps it to `502`.
-4. `normalizeOffers` (validate, reject invalid prices, clean names/coordinates) → `aggregateOffers` (group by normalised name, pick cheapest, compute savings) → `saveToRedis`.
-5. The result carries step timings, attempts, per-supplier status and cache metadata (the hotel list itself goes straight to Redis, not through workflow history).
+<details>
+<summary><b>The Temporal workflow</b></summary>
 
-Determinism: the workflow contains **no HTTP, Redis, `Math.random` or `process.env`**; configuration arrives via the input, and every I/O call is an activity (`fetchSupplierA`, `fetchSupplierB`, `normalizeOffers`, `aggregateOffers`, `saveToRedis`, `enrichCity`). The worker (`src/worker.ts`) registers the workflow and all activities. Inspect executions in the Temporal UI (http://localhost:8080) or on the app's **Workflows** page.
+`hotelOfferWorkflow` lives in `apps/backend/src/workflows/hotelOffer.workflow.ts`.
 
-**Deduplication rules** (`src/utils/normalize.ts`, `src/services/offers.ts`): lowercase, strip diacritics, `&`→`and`, drop punctuation, collapse whitespace, drop a leading "the" (word order is never changed). Invalid prices (≤0, `NaN`, non-numeric) are rejected. Equal prices are tie-broken by **higher commission, then supplier name** – deterministic regardless of arrival order.
+1. Supplier A, Supplier B and an optional city-enrichment activity start together (`Promise.all`). Each supplier call is wrapped so a failure becomes a result rather than rejecting the group, so the suppliers fail independently.
+2. Supplier activities get a timeout and a retry policy (500 ms initial interval, ×2 backoff, 3 attempts by default; never infinite). HTTP 4xx and malformed payloads are not retried.
+3. If both suppliers fail, the workflow throws a non-retryable `ALL_SUPPLIERS_FAILED`, which the API turns into a `502`.
+4. Otherwise it normalises, aggregates, and saves to Redis, each as its own activity.
+5. The result carries step timings, attempts and supplier status (the Workflows page draws its timeline from this). The hotel list goes straight to Redis, not through workflow history.
 
-## Redis implementation
+The workflow is deterministic: no HTTP, Redis, `Math.random` or `process.env`. Configuration comes in through the input, and all I/O happens in activities.
 
-Per normalised city:
+</details>
+
+<details>
+<summary><b>Deduplication and price rules</b></summary>
+
+- Names are normalised: lowercase, diacritics stripped, `&` → `and`, punctuation removed, whitespace collapsed, leading "the" dropped. Word order is never changed, so `Hotel Royal` and `Royal Hotel` stay distinct.
+- Prices that are zero, negative, `NaN` or not numbers are rejected and never selected.
+- Equal prices are tie-broken deterministically: higher commission first, then supplier name.
+- Hotels offered by one supplier are kept as-is, with zero savings.
+
+</details>
+
+<details>
+<summary><b>Redis layout</b></summary>
 
 | Key | Type | Content |
 | --- | --- | --- |
-| `hotels:<city>` | string (JSON) | Cache metadata; its existence means "warm". TTL = `CACHE_TTL_SECONDS` |
+| `hotels:<city>` | string (JSON) | Cache metadata; existence means "warm"; carries the TTL |
 | `hotel_prices:<city>` | sorted set | member = hotel slug, **score = cheapest price** |
-| `hotel_details:<city>` | hash | slug → JSON hotel (including all competing offers) |
+| `hotel_details:<city>` | hash | slug → JSON hotel, including all competing offers |
 
-- **Price filtering** is `ZRANGEBYSCORE hotel_prices:<city> <min|-inf> <max|+inf>` followed by `HMGET` for the returned slugs – the range selection happens in Redis, not in Express.
-- **Refresh without stale entries**: `DEL` + `ZADD` + `HSET` + `EXPIRE` run in a single `MULTI/EXEC`, so readers never see a half-written city and members from the previous dataset cannot survive (covered by tests).
-- Supplier/rating/name filtering and sorting are applied in Express on the (already price-filtered) result.
-- Metrics, workflow history and recent searches also live in Redis (survive API restarts).
+- Price filtering: `ZRANGEBYSCORE hotel_prices:<city> <min|-inf> <max|+inf>`, then `HMGET` for the returned slugs.
+- Refresh without stale data: `DEL` + `ZADD` + `HSET` + `EXPIRE` run in a single `MULTI/EXEC`, so readers never see a half-written city and old members cannot survive.
+- Metrics, workflow history and recent searches are also stored in Redis.
 
-## Supplier failure handling
+</details>
 
-- Retries and timeouts live in Temporal (see above). After retries are exhausted that supplier is marked `failed`; the other supplier's hotels are still aggregated, cached (30 s TTL) and served with `meta.degraded=true`.
-- Try it in the UI: **Suppliers → Failure simulation** (clearly labelled DEV ONLY) or `POST /api/dev/suppliers/supplierA {"enabled": false}`, then refresh a city. Set `SUPPLIER_A_ENABLED=false` / `SUPPLIER_B_ERROR_RATE=0.5` to start that way.
+<details>
+<summary><b>Simulating a supplier failure</b></summary>
+
+On the **Suppliers** page, use the clearly labelled *DEV ONLY* buttons, or call `POST /api/dev/suppliers/supplierA` with `{"enabled": false}`. Then run a fresh aggregation (the **Refresh** button, or `refresh=true`) to watch the retries, the `degraded` flag, and the metrics change. Cached cities keep serving until their TTL ends.
+
+</details>
 
 ## Testing
 
 ```bash
-npm test                      # backend (Vitest) + frontend
+npm test                  # backend + frontend
 npm run typecheck
-npm test -w apps/backend      # 55 tests
 ```
 
-Backend suites: name normalisation, deduplication/cheapest/tie/invalid-price/single-supplier logic, mock supplier endpoints, Redis cache + sorted-set filtering + stale-entry removal, API (hit/miss/refresh/validation/filters/sorting/offers/metrics/degraded/both-failed), health (healthy/degraded/unhealthy), and **two suites that run the real workflow on a real Temporal dev server** (downloaded automatically by `@temporalio/testing`): `workflow.test.ts` (concurrency, retries, degradation, total failure) and `e2e.test.ts` (HTTP → Express → Temporal client → worker → suppliers → Redis → HTTP). Redis is an in-memory mock (`ioredis-mock`) in tests. The first run downloads the Temporal test server binary, so it needs internet access.
+The 55 backend tests cover name normalisation, deduplication, tie-breaking, invalid prices, the mock suppliers, Redis sorted-set filtering and stale-entry removal, every API behaviour (hit/miss/refresh/validation/sorting/offers/metrics/degraded/both-failed) and health states. Two suites run the **real workflow on a real Temporal dev server** (downloaded automatically by `@temporalio/testing`, so the first run needs internet): `workflow.test.ts`, and `e2e.test.ts` which goes HTTP → Express → Temporal → worker → suppliers → Redis → HTTP. Redis is an in-memory mock in tests (`ioredis-mock`). The frontend has a small unit test for the currency and time formatting.
 
-## Postman
+## Project layout
 
-1. Postman → **Import** → select `postman/StaySync.postman_collection.json` and `postman/StaySync.postman_environment.json`.
-2. Choose the **StaySync Local** environment (variables `baseUrl`, `city`, `minPrice`, `maxPrice`).
-3. Run the collection (requests include assertions). CLI: `npx newman run postman/StaySync.postman_collection.json -e postman/StaySync.postman_environment.json`.
+```
+apps/
+  backend/
+    src/
+      app.ts · server.ts · worker.ts · container.ts
+      workflows/     deterministic Temporal workflow
+      activities/    all I/O: supplier HTTP, Redis, geocoding
+      temporal/      client (starts workflows) and worker factory
+      services/      offers (dedupe logic), search, health, metrics, analytics
+      suppliers/     the two mock supplier APIs and failure simulation
+      cache/         Redis client and the sorted-set hotel cache
+      routes/ controllers/ middleware/ schemas/ config/ utils/ types/
+    tests/           Vitest suites
+    scripts/         dev-temporal.ts, verify-stack.ts
+  frontend/
+    src/
+      pages/ components/ charts/ layouts/ hooks/ services/ utils/ types/
+docs/screenshots/    images used in this README
+postman/             collection + environment
+docker-compose.yml · render.yaml · vercel.json · .env.example
+```
 
-Folder 17 disables suppliers: with both disabled request 17c returns `502`; run 17d to restore.
-
-## Screenshots
-
-_Not included yet._ Run the app and capture: Overview (`/`), Hotel Search (`/search`, list and map views), the offers comparison modal, Suppliers, Workflows (timeline) and Analytics; add them under `docs/screenshots/` and link them here.
-
-## Deployment
-
-The project is container-first and platform-agnostic (Railway, Render, Fly.io, a VPS). Deploy **frontend**, **backend (API)**, **worker**, **Redis** and **Temporal** as separate long-running services.
-
-- **Temporal must be a persistent, long-running service – it cannot run as a serverless function.** The workers keep long-polling connections open. Use Temporal Cloud (recommended) or a self-hosted cluster (Postgres/MySQL-backed). The `temporalio/temporal` dev server in `docker-compose.yml` is for development only.
-- Backend and worker use the **same image** (`apps/backend/Dockerfile`); start the worker with `node dist/worker.js`. Scale workers independently.
-- Externalise configuration: `REDIS_URL`, `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE` (+ TLS/API key settings if you use Temporal Cloud – extend `temporal/client.ts` and `temporal/worker.ts`), `SUPPLIER_*_URL`, `CORS_ORIGIN`, API keys. Use the platform's secret store; never commit `.env`.
-- Set `NODE_ENV=production` (disables dev simulation endpoints) and `CORS_ORIGIN` to the frontend's origin.
-- Build the frontend with `--build-arg VITE_API_BASE_URL=https://api.example.com`, or `npm run build -w apps/frontend` with that env var, and serve `apps/frontend/dist` from any static host.
-- The mock suppliers are mounted in the API process. For a real deployment point `SUPPLIER_A_URL`/`SUPPLIER_B_URL` at the real services; in that case the simulation endpoints no longer affect them.
-- Don't publish Redis/Temporal ports in production: remove the `ports:` entries of `redis`, `temporal`, `temporal-ui` from the compose file (or use the platform's private network).
+`apps/backend/scripts/verify-stack.ts` boots the real API, worker and a Temporal dev server in one process with an **in-memory Redis**. It exists only to run the app without Docker or Redis; it is not used in any deployment.
 
 ## Limitations
 
-- Suppliers are **mocked** and live inside the API process; the failure simulator only affects those mocks.
-- Prices are per night in INR; no dates, occupancy or availability. Currency conversion is display-only.
-- Cache-hit metrics count `/api/hotels` requests; a `refresh=true` request counts as a miss. Workflow history shows executions recorded by this API (not a full Temporal visibility query), capped at the latest 100.
-- Analytics loads every supported city; the first call on a cold cache triggers one workflow per city.
-- The Docker Compose setup, and the `npm ci -w` production image build, were written but **could not be executed on the authoring machine** (no Docker available) – see the verification notes in the hand-off summary.
-- Hotel photos are stock Unsplash images chosen per hotel (gradient fallback if they fail to load).
-- Temporal dev-server persistence is SQLite in a volume; not for production.
+- The suppliers are **mocks** that live inside the API process; the failure simulator only affects them.
+- Prices are per night in INR, with no dates, occupancy or availability. Currency conversion is display-only.
+- Some hotels in the same city share a stock photo (a small set of Unsplash images is mapped by hotel type).
+- Cache-hit metrics count `/api/hotels` requests, and a `refresh=true` request counts as a miss. Workflow history is what this API recorded (latest 100), not a full Temporal visibility query.
+- The first Analytics load on a cold cache runs one workflow per supported city.
+- The "Sign in" link on the landing page opens the dashboard; there are no accounts.
+- Docker Compose and the Render/Vercel configs have not been run end-to-end yet. The frontend bundle is about 1.1 MB and not code-split.
 
-## Future improvements
+## Credits
 
-Date/occupancy-aware search, per-supplier circuit breakers, Temporal visibility queries for the workflow page, scheduled background refreshes (Temporal schedules), auth + rate limiting, OpenTelemetry tracing, route-level code splitting for the SPA, Playwright UI tests.
-#   T r i p a r e _ A I  
- 
+Photography via [Unsplash](https://unsplash.com). Map data © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors. Exchange rates from [Frankfurter](https://www.frankfurter.app).
