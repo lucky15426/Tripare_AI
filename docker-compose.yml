@@ -1,0 +1,114 @@
+name: staysync
+
+x-backend-env: &backend-env
+  NODE_ENV: ${NODE_ENV:-production}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000,http://localhost:5173}
+  ENABLE_DEV_ENDPOINTS: ${ENABLE_DEV_ENDPOINTS:-true}
+  # Internal networking uses service names, never localhost.
+  REDIS_URL: redis://redis:6379
+  TEMPORAL_ADDRESS: temporal:7233
+  TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
+  TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-hotel-offers}
+  TEMPORAL_TLS: ${TEMPORAL_TLS:-false}
+  TEMPORAL_API_KEY: ${TEMPORAL_API_KEY:-}
+  TEMPORAL_UI_URL: ${TEMPORAL_UI_URL:-http://localhost:8080}
+  SUPPLIER_A_URL: http://backend:4000/supplierA
+  SUPPLIER_B_URL: http://backend:4000/supplierB
+  CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-300}
+  DEGRADED_CACHE_TTL_SECONDS: ${DEGRADED_CACHE_TTL_SECONDS:-30}
+  SUPPLIER_TIMEOUT_MS: ${SUPPLIER_TIMEOUT_MS:-4000}
+  SUPPLIER_RETRY_INITIAL_MS: ${SUPPLIER_RETRY_INITIAL_MS:-500}
+  SUPPLIER_RETRY_BACKOFF: ${SUPPLIER_RETRY_BACKOFF:-2}
+  SUPPLIER_RETRY_MAX_ATTEMPTS: ${SUPPLIER_RETRY_MAX_ATTEMPTS:-3}
+  SUPPLIER_A_ENABLED: ${SUPPLIER_A_ENABLED:-true}
+  SUPPLIER_B_ENABLED: ${SUPPLIER_B_ENABLED:-true}
+  SUPPLIER_A_LATENCY_MS: ${SUPPLIER_A_LATENCY_MS:-250}
+  SUPPLIER_B_LATENCY_MS: ${SUPPLIER_B_LATENCY_MS:-550}
+  SUPPLIER_A_ERROR_RATE: ${SUPPLIER_A_ERROR_RATE:-0}
+  SUPPLIER_B_ERROR_RATE: ${SUPPLIER_B_ERROR_RATE:-0}
+  OPENWEATHER_API_KEY: ${OPENWEATHER_API_KEY:-}
+  GEOAPIFY_API_KEY: ${GEOAPIFY_API_KEY:-}
+  FRANKFURTER_URL: ${FRANKFURTER_URL:-https://api.frankfurter.app}
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # Temporal dev server (single binary, SQLite persisted in a volume). For production use a
+  # real Temporal cluster / Temporal Cloud and point TEMPORAL_ADDRESS at it.
+  temporal:
+    image: temporalio/temporal:latest
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--port", "7233", "--headless", "--db-filename", "/data/temporal.db"]
+    user: root # named volume is root-owned on first start
+    ports: ["7233:7233"]
+    volumes: [temporal-data:/data]
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  temporal-ui:
+    image: temporalio/ui:latest
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000
+    ports: ["8080:8080"]
+    depends_on:
+      temporal: { condition: service_healthy }
+    restart: unless-stopped
+
+  backend:
+    build: { context: ., dockerfile: apps/backend/Dockerfile }
+    environment:
+      <<: *backend-env
+      PORT: "4000"
+    ports: ["4000:4000"]
+    depends_on:
+      redis: { condition: service_healthy }
+      temporal: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  worker:
+    build: { context: ., dockerfile: apps/backend/Dockerfile }
+    command: ["node", "dist/worker.js"]
+    environment:
+      <<: *backend-env
+    depends_on:
+      redis: { condition: service_healthy }
+      temporal: { condition: service_healthy }
+      backend: { condition: service_healthy }
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: apps/frontend/Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:4000}
+    ports: ["3000:80"]
+    depends_on:
+      backend: { condition: service_healthy }
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  temporal-data:
