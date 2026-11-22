@@ -9,8 +9,8 @@ services:
     name: staysync-api
     runtime: node
     plan: starter # free works too but sleeps when idle, and the first request after a sleep takes ~1 minute
-    buildCommand: npm ci --include=dev && npm run build -w apps/backend
-    startCommand: npm run start -w apps/backend
+    buildCommand: npm install && npm run build
+    startCommand: npm start
     healthCheckPath: /healthz
     envVars:
       - key: NODE_VERSION

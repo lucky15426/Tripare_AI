@@ -3,14 +3,19 @@
   "private": true,
   "version": "1.0.0",
   "description": "StaySync - Hotel Offer Orchestrator (Temporal + Redis + React)",
-  "workspaces": ["apps/backend", "apps/frontend"],
+  "workspaces": [
+    "apps/backend",
+    "apps/frontend"
+  ],
   "scripts": {
     "dev:temporal": "npm run dev:temporal -w apps/backend",
-    "dev:backend":"npm run dev -w apps/backend",
+    "dev:backend": "npm run dev -w apps/backend",
     "dev:worker": "npm run dev:worker -w apps/backend",
     "dev:frontend": "npm run dev -w apps/frontend",
-    "build": "npm run build -w apps/backend && npm run build -w apps/frontend",
+    "build": "npm run build -w apps/backend",
     "test": "npm run test -w apps/backend && npm run test -w apps/frontend",
-    "typecheck": "npm run typecheck -w apps/backend && npm run typecheck -w apps/frontend"
+    "typecheck": "npm run typecheck -w apps/backend && npm run typecheck -w apps/frontend",
+    "build:all": "npm run build -w apps/backend && npm run build -w apps/frontend",
+    "start": "npm run start -w apps/backend"
   }
 }

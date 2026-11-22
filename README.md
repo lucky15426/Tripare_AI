@@ -101,8 +101,8 @@ The frontend is static and goes to **Vercel**. The whole backend goes to **one R
 1. Push the repo to GitHub.
 2. **Render, Redis:** *New → Key Value* (free plan, same region as the web service). Copy its **Internal** URL.
 3. **Render, web service:** *New → Web Service*, pick the repo, runtime **Node**, root directory **empty**.
-   - Build command: `npm ci --include=dev && npm run build -w apps/backend`
-   - Start command: `npm run start -w apps/backend`
+   - Build command: `npm install && npm run build` (Render's default; builds the backend)
+   - Start command: `npm start` (Render's default)
    - Health check path: `/healthz`
    - Environment: `NODE_VERSION=22`, `NODE_ENV=production`, `EMBEDDED_TEMPORAL=true`, `REDIS_URL=<the Internal URL>`
    - Or use *New → Blueprint*, which reads [`render.yaml`](render.yaml) and sets all of this up.
